@@ -4,20 +4,26 @@ import {
   BeadsUnavailableError,
   createIssue,
   deleteIssue,
+  getBeadsMeta,
   getIssue,
+  initBeads,
   isBeadsInitialized,
   listIssues,
   updateIssue,
 } from "./bd.server";
 import type {
+  BeadsMetaResult,
   CreateBeadResult,
   DeleteBeadResult,
   GetBeadResult,
+  InitBeadsResult,
   ListBeadsResult,
   UpdateBeadResult,
+  beadsMetaRpc,
   createBeadRpc,
   deleteBeadRpc,
   getBeadRpc,
+  initBeadsRpc,
   listBeadsRpc,
   updateBeadRpc,
 } from "./beads.shared";
@@ -54,6 +60,46 @@ export async function listBeads(
   } catch (error) {
     const message = error instanceof BeadsUnavailableError ? error.message : "Failed to list beads.";
     return { available: true, issues: [], error: message };
+  }
+}
+
+export async function initBead(
+  { projectId }: ZodOutput<typeof initBeadsRpc.input>,
+  { paseo }: PluginHandlerContext,
+): Promise<InitBeadsResult> {
+  const projectRootPath = await resolveProjectRoot(paseo, projectId);
+  if (!projectRootPath) {
+    return { ok: false, error: "Project not found." };
+  }
+
+  if (await isBeadsInitialized(projectRootPath)) {
+    return { ok: true, error: null };
+  }
+
+  try {
+    await initBeads(projectRootPath);
+    return { ok: true, error: null };
+  } catch (error) {
+    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to run `bd init`.";
+    return { ok: false, error: message };
+  }
+}
+
+export async function beadsMeta(
+  { projectId }: ZodOutput<typeof beadsMetaRpc.input>,
+  { paseo }: PluginHandlerContext,
+): Promise<BeadsMetaResult> {
+  const projectRootPath = await resolveProjectRoot(paseo, projectId);
+  if (!projectRootPath) {
+    return { types: [], statuses: [], error: "Project not found." };
+  }
+
+  try {
+    const meta = await getBeadsMeta(projectRootPath);
+    return { ...meta, error: null };
+  } catch (error) {
+    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to load bd types/statuses.";
+    return { types: [], statuses: [], error: message };
   }
 }
 

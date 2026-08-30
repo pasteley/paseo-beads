@@ -15,11 +15,21 @@ It's a thin UI over the real CLI, not a reimplementation: every action shells ou
 ## What it does
 
 - A **Beads** tab in the workspace bar shows a sortable, searchable table of the project's
-  issues.
-- Each row opens an inline detail panel: title, status, priority, and a markdown
-  description are editable, and a bead can be deleted with a confirm.
-- Dependency links ("depends on" / "required by") connect related beads for quick
-  navigation between them.
+  issues, ids sorted naturally (`bd-2` before `bd-10`). Sort by any column including issue
+  type; **Group** toggles an epic-nested tree (mirrors `bd list`) whose branches
+  collapse/expand. Columns drop out as the panel narrows — status shrinks to its `bd` glyph,
+  then priority/updated/id fall away — leaving type + title on an ultra-narrow sidebar.
+- The search field doubles as a filter: bare words match id/title, `key:value` tokens
+  filter (`type:bug`, `status:open`, `priority:1`, `assignee:me`, `parent:bd-3`, a space
+  after the colon is fine), and `p0`–`p4` is shorthand for `priority:`. Active filters show
+  as removable chips.
+- Each row opens an inline detail panel: title, status, priority, type, and a markdown
+  description are editable, and a bead can be deleted with a confirm. Status/type options
+  come from `bd types` / `bd statuses`, so custom vocab shows up too. A long description
+  starts collapsed behind a toggle. Dependency links render as a bulleted list.
+- **New bead** takes a title, type, priority, and description.
+- In a project without a bd database, a **Run bd init** button initializes it in place
+  (`bd init --non-interactive` in the project root).
 - On an open, unblocked bead, **Create workspace** spins up a worktree and links it back to
   the bead (`external-ref`), so the panel remembers which workspace picked it up.
 

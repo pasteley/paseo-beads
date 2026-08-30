@@ -18,6 +18,8 @@ export interface BeadIssue {
   priority: number; // 0 (highest) .. 4 (lowest)
   issueType: string;
   assignee: string | null;
+  /** Direct parent issue id (`parent-child` dependency), or null for a top-level issue. */
+  parent: string | null;
   dependencyCount: number;
   dependentCount: number;
   commentCount: number;
@@ -54,6 +56,7 @@ interface RawBeadIssue {
   priority: number;
   issue_type: string;
   assignee?: string;
+  parent?: string;
   dependency_count?: number;
   dependent_count?: number;
   comment_count?: number;
@@ -90,6 +93,7 @@ function toBeadIssue(raw: RawBeadIssue): BeadIssue {
     priority: raw.priority,
     issueType: raw.issue_type,
     assignee: raw.assignee ?? null,
+    parent: raw.parent ?? null,
     dependencyCount: raw.dependency_count ?? 0,
     dependentCount: raw.dependent_count ?? 0,
     commentCount: raw.comment_count ?? 0,
@@ -161,6 +165,7 @@ export interface UpdateIssuePatch {
   description?: string;
   priority?: number;
   status?: string;
+  issueType?: string;
   externalRef?: string;
 }
 
@@ -170,6 +175,7 @@ export async function updateIssue(cwd: string, id: string, patch: UpdateIssuePat
   if (patch.description !== undefined) args.push("--description", patch.description);
   if (patch.priority !== undefined) args.push("--priority", String(patch.priority));
   if (patch.status !== undefined) args.push("--status", patch.status);
+  if (patch.issueType !== undefined) args.push("--type", patch.issueType);
   if (patch.externalRef !== undefined) args.push("--external-ref", patch.externalRef);
   args.push("--json");
   const stdout = await runBd(cwd, args);
@@ -183,14 +189,80 @@ export interface CreateIssuePatch {
   title: string;
   description?: string;
   priority?: number;
+  issueType?: string;
 }
 
 export async function createIssue(cwd: string, patch: CreateIssuePatch): Promise<BeadIssue> {
   const args = ["create", patch.title, "--json"];
   if (patch.description !== undefined) args.push("--description", patch.description);
   if (patch.priority !== undefined) args.push("--priority", String(patch.priority));
+  if (patch.issueType !== undefined) args.push("--type", patch.issueType);
   const stdout = await runBd(cwd, args);
   return parseSingleIssue(stdout);
+}
+
+/** Runs `bd init` in a not-yet-initialized project root. `--non-interactive` keeps it from
+ * blocking on the setup wizard (execFile has no tty, so bd would auto-detect this anyway —
+ * passing it explicitly is just belt-and-suspenders). */
+export async function initBeads(cwd: string): Promise<void> {
+  await runBd(cwd, ["init", "--non-interactive"]);
+}
+
+export interface BeadStatusMeta {
+  name: string;
+  icon: string;
+  category: string;
+}
+
+export interface BeadsMeta {
+  types: string[];
+  statuses: BeadStatusMeta[];
+}
+
+interface RawTypeEntry {
+  name?: string;
+}
+interface RawStatusEntry {
+  name?: string;
+  icon?: string;
+  category?: string;
+}
+
+/** Pulls every array-of-objects out of the payload (built_in_*, core_types, custom_*, …) —
+ * bd only includes the `custom_*` keys when custom vocab is configured, so we don't hard-code
+ * the key names. */
+function collectEntries<T>(payload: unknown): T[] {
+  if (!payload || typeof payload !== "object") return [];
+  const out: T[] = [];
+  for (const value of Object.values(payload as Record<string, unknown>)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === "object") out.push(item as T);
+      }
+    }
+  }
+  return out;
+}
+
+/** Reads the type and status vocabularies `bd` accepts for this project. */
+export async function getBeadsMeta(cwd: string): Promise<BeadsMeta> {
+  const [typesOut, statusesOut] = await Promise.all([
+    runBd(cwd, ["types", "--json"]),
+    runBd(cwd, ["statuses", "--json"]),
+  ]);
+
+  const typeEntries = collectEntries<RawTypeEntry>(JSON.parse(typesOut));
+  const statusEntries = collectEntries<RawStatusEntry>(JSON.parse(statusesOut));
+
+  const types = [...new Set(typeEntries.map((entry) => entry.name).filter((name): name is string => Boolean(name)))];
+  const statuses: BeadStatusMeta[] = [];
+  const seenStatus = new Set<string>();
+  for (const entry of statusEntries) {
+    if (!entry.name || seenStatus.has(entry.name)) continue;
+    seenStatus.add(entry.name);
+    statuses.push({ name: entry.name, icon: entry.icon ?? "•", category: entry.category ?? "active" });
+  }
+  return { types, statuses };
 }
 
 /** Fetches one issue with both dependency directions resolved. `bd show` does not

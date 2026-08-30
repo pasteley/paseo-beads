@@ -4,418 +4,133 @@ import { Icon, useToast } from "@getpaseo/plugin/react-native";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ActivityIndicator,
+  type GestureResponderEvent,
+  type LayoutChangeEvent,
   Pressable,
   ScrollView,
   Text,
   TextInput,
   View,
-  type TextStyle,
   type ViewStyle,
 } from "react-native";
 import { formatRelativeDate } from "./format";
 import { MarkdownText } from "./markdown";
 import {
+  beadsMetaRpc,
   createBeadRpc,
   deleteBeadRpc,
   getBeadRpc,
+  initBeadsRpc,
   listBeadsRpc,
   updateBeadRpc,
   type BeadDependency,
   type BeadIssue,
+  type BeadStatus,
 } from "./beads.shared";
+import {
+  FONT_SIZE,
+  RADIUS,
+  SPACE,
+  TREE_INDENT,
+  buildStyles,
+  hoverTitle,
+  type PanelStyles,
+} from "./beads.theme";
+import {
+  COLUMNS,
+  COLUMN_MIN_WIDTH,
+  FALLBACK_ISSUE_TYPES,
+  FILTER_KEYS,
+  PRIORITY_VALUES,
+  STATUS_GLYPH_MAX_WIDTH,
+  WORKSPACE_REF_PREFIX,
+  branchSuggestion,
+  buildFlatRows,
+  buildGroupedRows,
+  dropFilter,
+  findActiveWorkspace,
+  hasActiveFilters,
+  issueTypeIcon,
+  matchesSearch,
+  parseSearch,
+  pluralize,
+  priorityLabel,
+  priorityTone,
+  resolveStatus,
+  statusLabel,
+  statusOptions,
+  stringifySearch,
+  type BeadsWorkspace,
+  type ColumnKey,
+  type FilterKey,
+  type SortDirection,
+  type SortField,
+  type TreeRow,
+} from "./beads.view";
 
-type Tone = "neutral" | "success" | "warning" | "danger" | "accent";
-type SortField = "id" | "title" | "status" | "priority" | "updatedAt";
-type SortDirection = "asc" | "desc";
-type ColumnKey = SortField | "type";
 // Ahead of the currently published SDK (getpaseo/paseo#3901) — optional so this degrades
 // to plain text on hosts that don't populate it yet.
 type PluginNavigation = PluginWorkspacePanelProps["navigation"];
 
-// Mirrors packages/app/src/styles/theme.ts SPACING/FONT_SIZE/BORDER_RADIUS/FONT_WEIGHT —
-// the plugin runtime only exposes PluginTheme.colors, not the token objects themselves,
-// so the scale is reproduced here to stay on the same rhythm as the host app.
-const SPACE = { 1: 4, 1.5: 6, 2: 8, 3: 12, 4: 16, 6: 24 } as const;
-const FONT_SIZE = { sm: 12, base: 14 } as const;
-const FONT_WEIGHT = { normal: "normal", medium: "500", semibold: "600" } as const;
-const RADIUS = { md: 6, lg: 8, full: 9999 } as const;
-const CONTROL_HEIGHT_SM = 32;
-
-const STATUS_OPTIONS = ["open", "in_progress", "blocked", "deferred", "closed"] as const;
-const PRIORITY_VALUES = [0, 1, 2, 3, 4] as const;
-const PRIORITY_LABELS = ["P0", "P1", "P2", "P3", "P4"];
-
-// bd's built-in issue types (bd create --help): task | bug | feature | epic | chore | decision.
-// Custom types (types.custom config) fall back to a generic marker.
-const ISSUE_TYPE_ICONS: Record<string, string> = {
-  task: "ListTodo",
-  bug: "Bug",
-  feature: "Sparkles",
-  epic: "Layers",
-  chore: "Wrench",
-  decision: "Scale",
-};
-
-function issueTypeIcon(issueType: string): string {
-  return ISSUE_TYPE_ICONS[issueType] ?? "Circle";
+/** Returns `value` delayed by `delayMs` — keeps the search box responsive while the (memoised
+ * but not free) filter/tree rebuild only runs once typing pauses. */
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+  return debounced;
 }
 
-// Column order: a leading type glyph, identifying/scannable columns, free-text title last
-// so the fixed columns hold a predictable width and the table doesn't stretch to the
-// title's length. Only date-sortable/text-sortable columns are sortable; type is a glyph.
-const COLUMNS: ReadonlyArray<{ key: ColumnKey; label: string; flex: number; sortable: boolean }> = [
-  { key: "type", label: "", flex: 0.5, sortable: false },
-  { key: "id", label: "ID", flex: 1.1, sortable: true },
-  { key: "status", label: "STATUS", flex: 1, sortable: true },
-  { key: "priority", label: "PRI", flex: 0.6, sortable: true },
-  { key: "updatedAt", label: "UPDATED", flex: 1.1, sortable: true },
-  { key: "title", label: "TITLE", flex: 3, sortable: true },
-];
-
-const WORKSPACE_REF_PREFIX = "paseo:";
-
-interface BeadsWorkspace {
-  id: string;
-  title: string | null;
-  gitRuntime?: { currentBranch?: string | null } | null;
+interface CellContext {
+  styles: PanelStyles;
+  statuses: readonly BeadStatus[];
+  /** Below STATUS_GLYPH_MAX_WIDTH the STATUS cell renders as just the bd glyph. */
+  compactStatus: boolean;
 }
 
-/** True only for a workspace branch that this bead's suggested branch name actually owns —
- * an exact match or `<id>-<slug>`, never a loose substring that could false-match a sibling
- * id sharing a numeric prefix (e.g. "bd-1" inside "bd-10"). Fallback for beads created
- * before the `externalRef` backlink existed. */
-function branchBelongsToBead(currentBranch: string | null | undefined, issueId: string): boolean {
-  if (!currentBranch) return false;
-  return currentBranch === issueId || currentBranch.startsWith(`${issueId}-`);
-}
-
-/** Prefers the exact `paseo:<workspaceId>` backlink written when the workspace was created
- * from this panel; falls back to the branch-name heuristic for beads/workspaces predating it
- * or where the linked workspace was since archived. */
-function findActiveWorkspace(issue: BeadIssue, workspaces: readonly BeadsWorkspace[]): BeadsWorkspace | null {
-  if (issue.externalRef?.startsWith(WORKSPACE_REF_PREFIX)) {
-    const workspaceId = issue.externalRef.slice(WORKSPACE_REF_PREFIX.length);
-    const linked = workspaces.find((workspace) => workspace.id === workspaceId);
-    if (linked) return linked;
-  }
-  return workspaces.find((workspace) => branchBelongsToBead(workspace.gitRuntime?.currentBranch, issue.id)) ?? null;
-}
-
-interface ChipStyles {
-  base: ViewStyle;
-  selected: ViewStyle;
-  text: TextStyle;
-  textSelected: TextStyle;
-}
-
-interface ButtonVariantStyles {
-  base: ViewStyle;
-  text: TextStyle;
-}
-
-interface PanelStyles {
-  screen: ViewStyle;
-  header: ViewStyle;
-  title: TextStyle;
-  refreshLabel: TextStyle;
-  toolbar: ViewStyle;
-  searchWrap: ViewStyle;
-  searchIcon: ViewStyle;
-  searchInput: TextStyle;
-  detail: TextStyle;
-  errorBanner: ViewStyle;
-  errorBannerText: TextStyle;
-  table: ViewStyle;
-  headerRow: ViewStyle;
-  headerCellFlex: ViewStyle;
-  headerCell: ViewStyle;
-  headerCellText: TextStyle;
-  row: ViewStyle;
-  rowBordered: ViewStyle;
-  rowSelected: ViewStyle;
-  cellText: TextStyle;
-  cellTextMuted: TextStyle;
-  panel: ViewStyle;
-  panelBordered: ViewStyle;
-  panelBody: ViewStyle;
-  panelHeaderRow: ViewStyle;
-  panelHeaderText: TextStyle;
-  iconButton: ViewStyle;
-  sectionLabel: TextStyle;
-  sectionRow: ViewStyle;
-  linkGroup: ViewStyle;
-  linkRow: ViewStyle;
-  linkText: TextStyle;
-  metaText: TextStyle;
-  linkAction: TextStyle;
-  fieldLabel: TextStyle;
-  fieldInput: TextStyle;
-  fieldInputMultiline: TextStyle;
-  markdownPreview: ViewStyle;
-  actionRow: ViewStyle;
-  buttonDisabled: ViewStyle;
-  tone: Record<Tone, TextStyle>;
-  chip: ChipStyles;
-  button: Record<"primary" | "secondary" | "ghost" | "destructive", ButtonVariantStyles>;
-}
-
-function buildStyles(theme: PluginTheme, compact: boolean): PanelStyles {
-  const colors = theme.colors;
-  return {
-    screen: { flex: 1, padding: compact ? SPACE[3] : SPACE[4], backgroundColor: colors.surface0, gap: SPACE[3] },
-    header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-    title: { color: colors.foreground, fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.semibold },
-    refreshLabel: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm },
-    toolbar: { flexDirection: "row", alignItems: "center", gap: SPACE[2] },
-    searchWrap: { flex: 1, justifyContent: "center" },
-    searchIcon: { position: "absolute", left: SPACE[2], zIndex: 1 },
-    searchInput: {
-      height: CONTROL_HEIGHT_SM,
-      borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: RADIUS.lg,
-      paddingLeft: SPACE[6],
-      paddingRight: SPACE[2],
-      color: colors.foreground,
-      fontSize: FONT_SIZE.base,
-      backgroundColor: colors.surface1,
-      outlineWidth: 0,
-    },
-    detail: { color: colors.foregroundMuted, fontSize: FONT_SIZE.base },
-    errorBanner: {
-      borderWidth: 1,
-      borderColor: colors.statusDanger,
-      borderRadius: RADIUS.lg,
-      padding: SPACE[3],
-      backgroundColor: colors.surface1,
-      gap: SPACE[2],
-    },
-    errorBannerText: { color: colors.statusDanger, fontSize: FONT_SIZE.sm },
-    table: { borderWidth: 1, borderColor: colors.border, borderRadius: RADIUS.lg, overflow: "hidden" },
-    headerRow: {
-      flexDirection: "row",
-      paddingVertical: SPACE[2],
-      paddingHorizontal: SPACE[3],
-      backgroundColor: colors.surface1,
-      borderBottomWidth: 1,
-      borderColor: colors.border,
-    },
-    headerCellFlex: { flexDirection: "row", alignItems: "center" },
-    headerCell: { flexDirection: "row", alignItems: "center", gap: SPACE[1] },
-    headerCellText: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm, fontWeight: FONT_WEIGHT.semibold },
-    row: {
-      flexDirection: "row",
-      paddingVertical: SPACE[2] + 2,
-      paddingHorizontal: SPACE[3],
-      alignItems: "center",
-      backgroundColor: colors.surface0,
-    },
-    rowBordered: { borderTopWidth: 1, borderColor: colors.border },
-    rowSelected: { backgroundColor: colors.surface2 },
-    cellText: { color: colors.foreground, fontSize: FONT_SIZE.base },
-    cellTextMuted: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm },
-    panel: { backgroundColor: colors.surface1, padding: SPACE[4] },
-    panelBordered: { borderTopWidth: 1, borderColor: colors.border },
-    panelBody: { gap: SPACE[3] },
-    panelHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-    panelHeaderText: { color: colors.foreground, fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.semibold },
-    iconButton: { padding: SPACE[1] },
-    sectionLabel: {
-      color: colors.foregroundMuted,
-      fontSize: FONT_SIZE.sm,
-      fontWeight: FONT_WEIGHT.semibold,
-      letterSpacing: 0.4,
-      marginBottom: SPACE[1.5],
-    },
-    sectionRow: { flexDirection: "row", flexWrap: "wrap", gap: SPACE[1.5] },
-    linkGroup: { gap: SPACE[1] },
-    linkRow: { flexDirection: "row", alignItems: "center", gap: SPACE[1.5] },
-    linkText: { color: colors.foreground, fontSize: FONT_SIZE.sm, flexShrink: 1 },
-    metaText: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm },
-    linkAction: { color: colors.accent, fontSize: FONT_SIZE.sm, textDecorationLine: "underline" },
-    fieldLabel: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm, fontWeight: FONT_WEIGHT.medium, marginBottom: SPACE[1] },
-    fieldInput: {
-      borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: RADIUS.lg,
-      padding: SPACE[2],
-      color: colors.foreground,
-      backgroundColor: colors.surface0,
-      fontSize: FONT_SIZE.base,
-      outlineWidth: 0,
-    },
-    fieldInputMultiline: {
-      borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: RADIUS.lg,
-      padding: SPACE[2],
-      color: colors.foreground,
-      backgroundColor: colors.surface0,
-      minHeight: 84,
-      textAlignVertical: "top",
-      fontSize: FONT_SIZE.base,
-      outlineWidth: 0,
-    },
-    markdownPreview: {
-      borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: RADIUS.lg,
-      padding: SPACE[2],
-      backgroundColor: colors.surface0,
-      minHeight: 84,
-    },
-    actionRow: { flexDirection: "row", alignItems: "center", gap: SPACE[2] },
-    buttonDisabled: { opacity: 0.5 },
-    tone: {
-      neutral: { color: colors.foregroundMuted },
-      success: { color: colors.statusSuccess },
-      warning: { color: colors.statusWarning },
-      danger: { color: colors.statusDanger },
-      accent: { color: colors.accent },
-    },
-    chip: {
-      base: {
-        height: 28,
-        justifyContent: "center",
-        paddingHorizontal: SPACE[3],
-        borderRadius: RADIUS.full,
-        borderWidth: 1,
-        borderColor: colors.border,
-        backgroundColor: "transparent",
-      },
-      selected: {
-        height: 28,
-        justifyContent: "center",
-        paddingHorizontal: SPACE[3],
-        borderRadius: RADIUS.full,
-        borderWidth: 1,
-        borderColor: colors.border,
-        backgroundColor: colors.surface2,
-      },
-      text: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm },
-      textSelected: { color: colors.foreground, fontSize: FONT_SIZE.sm, fontWeight: FONT_WEIGHT.medium },
-    },
-    button: {
-      primary: {
-        base: {
-          height: CONTROL_HEIGHT_SM,
-          justifyContent: "center",
-          alignItems: "center",
-          paddingHorizontal: SPACE[4],
-          borderRadius: RADIUS.lg,
-          backgroundColor: colors.accent,
-        },
-        text: { color: colors.accentForeground, fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.normal },
-      },
-      secondary: {
-        base: {
-          height: CONTROL_HEIGHT_SM,
-          justifyContent: "center",
-          alignItems: "center",
-          paddingHorizontal: SPACE[4],
-          borderRadius: RADIUS.lg,
-          backgroundColor: colors.surface2,
-          borderWidth: 1,
-          borderColor: colors.border,
-        },
-        text: { color: colors.foreground, fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.normal },
-      },
-      ghost: {
-        base: {
-          height: CONTROL_HEIGHT_SM,
-          justifyContent: "center",
-          alignItems: "center",
-          paddingHorizontal: SPACE[2],
-          borderRadius: RADIUS.lg,
-          backgroundColor: "transparent",
-        },
-        text: { color: colors.foregroundMuted, fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.normal },
-      },
-      destructive: {
-        base: {
-          height: CONTROL_HEIGHT_SM,
-          justifyContent: "center",
-          alignItems: "center",
-          paddingHorizontal: SPACE[4],
-          borderRadius: RADIUS.lg,
-          backgroundColor: colors.statusDanger,
-        },
-        text: { color: "#ffffff", fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.normal },
-      },
-    },
-  };
-}
-
-function priorityLabel(priority: number): string {
-  return PRIORITY_LABELS[priority] ?? `P${priority}`;
-}
-
-// Mirrors bd's actual status values (bd statuses) verbatim — matches the STATUS chip
-// options exactly, so the table and the editor never disagree about what a status means.
-const STATUS_TONES: Record<string, Tone> = {
-  open: "warning",
-  in_progress: "accent",
-  blocked: "danger",
-  deferred: "neutral",
-  closed: "success",
-};
-
-function statusTone(status: string): { label: string; tone: Tone } {
-  const label = status === "in_progress" ? "In progress" : status.charAt(0).toUpperCase() + status.slice(1);
-  return { label, tone: STATUS_TONES[status] ?? "neutral" };
-}
-
-
-function branchSuggestion(issue: BeadIssue): string {
-  return `${issue.id}-${issue.title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "")
-    .slice(0, 40)}`;
-}
-
-function matchesQuery(issue: BeadIssue, query: string): boolean {
-  if (!query.trim()) return true;
-  const haystack = `${issue.id} ${issue.title}`.toLowerCase();
-  return haystack.includes(query.trim().toLowerCase());
-}
-
-function compareBeads(a: BeadIssue, b: BeadIssue, field: SortField): number {
-  if (field === "priority") return a.priority - b.priority;
-  if (field === "updatedAt") return a.updatedAt.localeCompare(b.updatedAt);
-  return a[field].localeCompare(b[field]);
-}
-
-function sortBeads(issues: BeadIssue[], field: SortField, direction: SortDirection): BeadIssue[] {
-  const sign = direction === "asc" ? 1 : -1;
-  return [...issues].sort((a, b) => sign * compareBeads(a, b, field));
-}
-
-function pluralize(count: number, noun: string): string {
-  return `${count} ${noun}${count === 1 ? "" : "s"}`;
-}
-
-function renderCell(key: ColumnKey, issue: BeadIssue, styles: PanelStyles): ReactNode {
+function renderCell(key: ColumnKey, issue: BeadIssue, ctx: CellContext): ReactNode {
+  const { styles } = ctx;
   switch (key) {
     case "type":
-      return <Icon name={issueTypeIcon(issue.issueType)} size={14} color={styles.cellTextMuted.color as string} />;
-    case "id":
       return (
-        <Text style={styles.cellTextMuted} numberOfLines={1}>
-          {issue.id}
-        </Text>
+        <View
+          accessibilityLabel={issue.issueType}
+          {...hoverTitle(issue.issueType)}
+          style={{ alignItems: "flex-start" }}
+        >
+          <Icon name={issueTypeIcon(issue.issueType)} size={15} color={styles.cellTextMuted.color as string} />
+        </View>
       );
+    case "id":
+      // Never truncated — the id is how you refer to a bead, so it must always be readable.
+      return <Text style={styles.cellId}>{issue.id}</Text>;
     case "status": {
-      const status = statusTone(issue.status);
+      const status = resolveStatus(issue.status, ctx.statuses);
+      const color = styles.tone[status.tone].color as string;
+      if (ctx.compactStatus) {
+        return (
+          <Text accessibilityLabel={status.label} {...hoverTitle(status.label)} style={{ color, fontSize: FONT_SIZE.base }}>
+            {status.glyph}
+          </Text>
+        );
+      }
       return (
-        <Text style={[styles.cellText, styles.tone[status.tone]]} numberOfLines={1}>
-          {status.label}
-        </Text>
+        <View style={styles.dotRow}>
+          <View style={[styles.statusDot, { backgroundColor: color }]} />
+          <Text style={[styles.cellText, styles.tone[status.tone]]} numberOfLines={1}>
+            {status.label}
+          </Text>
+        </View>
       );
     }
     case "priority":
-      return <Text style={styles.cellTextMuted}>{priorityLabel(issue.priority)}</Text>;
+      return (
+        <Text style={[styles.cellTextMuted, styles.tone[priorityTone(issue.priority)]]}>
+          {priorityLabel(issue.priority)}
+        </Text>
+      );
     case "updatedAt":
       return <Text style={styles.cellTextMuted}>{formatRelativeDate(issue.updatedAt)}</Text>;
     case "title":
@@ -471,74 +186,176 @@ interface ColumnHeaderProps {
   column: (typeof COLUMNS)[number];
   sortField: SortField;
   sortDirection: SortDirection;
+  idColumnWidth: number;
   styles: PanelStyles;
   theme: PluginTheme;
   onSort: (field: SortField) => void;
 }
 
-function ColumnHeader({ column, sortField, sortDirection, styles, theme, onSort }: ColumnHeaderProps) {
+// The id column is content-width (never truncated) but must line up between the header and
+// the body, so both take the same explicit width, measured from the longest visible id.
+function idCellStyle(idColumnWidth: number): ViewStyle {
+  return { width: idColumnWidth, flexGrow: 0, flexShrink: 0, paddingRight: SPACE[3] };
+}
+
+function ColumnHeader({ column, sortField, sortDirection, idColumnWidth, styles, theme, onSort }: ColumnHeaderProps) {
   const handlePress = useCallback(() => onSort(column.key as SortField), [onSort, column.key]);
-  if (!column.sortable) {
-    return (
-      <View style={[styles.headerCellFlex, { flex: column.flex }]}>
-        <Text style={styles.headerCellText}>{column.label}</Text>
-      </View>
-    );
-  }
   const active = sortField === column.key;
   return (
-    <Pressable accessibilityRole="button" onPress={handlePress} style={{ flex: column.flex }}>
+    <Pressable
+      accessibilityRole="button"
+      onPress={handlePress}
+      style={column.key === "id" ? idCellStyle(idColumnWidth) : { flex: column.flex }}
+    >
       <View style={styles.headerCell}>
-        <Text style={styles.headerCellText}>{column.label}</Text>
+        <Text style={[styles.headerCellText, active ? { color: theme.colors.foreground } : null]}>{column.label}</Text>
         {active ? (
           <Icon name={sortDirection === "asc" ? "ChevronUp" : "ChevronDown"} size={12} color={theme.colors.accent} />
+        ) : (
+          <Icon name="ChevronsUpDown" size={11} color={theme.colors.border} />
+        )}
+      </View>
+    </Pressable>
+  );
+}
+
+type VisibleColumn = (typeof COLUMNS)[number];
+
+interface BeadRowProps {
+  row: TreeRow;
+  columns: readonly VisibleColumn[];
+  idColumnWidth: number;
+  /** Fixed width of the leading tree gutter (0 when not grouped). Identical in the header
+   * and every row, so the data columns stay grid-aligned regardless of nesting depth. */
+  treeColumnWidth: number;
+  cellContext: CellContext;
+  bordered: boolean;
+  selected: boolean;
+  grouped: boolean;
+  styles: PanelStyles;
+  theme: PluginTheme;
+  onPress: (issue: BeadIssue) => void;
+  onToggleCollapse: (id: string) => void;
+}
+
+function BeadRow({
+  row,
+  columns,
+  idColumnWidth,
+  treeColumnWidth,
+  cellContext,
+  bordered,
+  selected,
+  grouped,
+  styles,
+  theme,
+  onPress,
+  onToggleCollapse,
+}: BeadRowProps) {
+  const { issue, depth, childCount, collapsed } = row;
+  const isGroupHeader = grouped && childCount > 0;
+  const handlePress = useCallback(() => onPress(issue), [onPress, issue]);
+  // Stop the tap from also reaching the row Pressable (which would open the detail panel).
+  const handleToggle = useCallback(
+    (event: GestureResponderEvent) => {
+      event.stopPropagation();
+      onToggleCollapse(issue.id);
+    },
+    [onToggleCollapse, issue.id],
+  );
+  const rowStyle = [
+    styles.row,
+    bordered ? styles.rowBordered : null,
+    isGroupHeader ? styles.groupHeaderRow : null,
+    selected ? styles.rowSelected : null,
+  ];
+  return (
+    <Pressable accessibilityRole="button" onPress={handlePress}>
+      <View style={rowStyle}>
+        {grouped ? (
+          <View style={{ width: treeColumnWidth, flexDirection: "row", alignItems: "center" }}>
+            {childCount > 0 ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={collapsed ? `Expand ${issue.id}` : `Collapse ${issue.id}`}
+                onPress={handleToggle}
+                style={[styles.groupToggle, { marginLeft: depth * TREE_INDENT }]}
+              >
+                {/* One glyph, rotated — ChevronRight and ChevronDown don't have identical
+                    metrics, which made the row twitch on toggle. */}
+                <View style={{ transform: [{ rotate: collapsed ? "-90deg" : "0deg" }] }}>
+                  <Icon name="ChevronDown" size={14} color={theme.colors.foregroundMuted} />
+                </View>
+              </Pressable>
+            ) : null}
+          </View>
+        ) : null}
+        {columns.map((column) => (
+          <View key={column.key} style={column.key === "id" ? idCellStyle(idColumnWidth) : { flex: column.flex }}>
+            {renderCell(column.key, issue, cellContext)}
+          </View>
+        ))}
+        {grouped && collapsed ? (
+          <Text style={[styles.cellTextMuted, { marginLeft: "auto", paddingLeft: SPACE[2] }]}>
+            {childCount === 1 ? "1 child" : `${childCount} children`}
+          </Text>
         ) : null}
       </View>
     </Pressable>
   );
 }
 
-interface BeadRowProps {
-  issue: BeadIssue;
-  bordered: boolean;
-  selected: boolean;
-  styles: PanelStyles;
-  onPress: (issue: BeadIssue) => void;
-}
+const LINK_LIST_CAP = 6;
+const DESC_LONG_CHARS = 700;
+const DESC_LONG_LINES = 14;
+const DESC_COLLAPSED_HEIGHT = 260;
 
-function BeadRow({ issue, bordered, selected, styles, onPress }: BeadRowProps) {
-  const handlePress = useCallback(() => onPress(issue), [onPress, issue]);
-  const rowStyle = [styles.row, bordered ? styles.rowBordered : null, selected ? styles.rowSelected : null];
-  return (
-    <Pressable accessibilityRole="button" onPress={handlePress}>
-      <View style={rowStyle}>
-        {COLUMNS.map((column) => (
-          <View key={column.key} style={{ flex: column.flex }}>
-            {renderCell(column.key, issue, styles)}
-          </View>
-        ))}
-      </View>
-    </Pressable>
-  );
-}
-
-interface LinkRowProps {
-  dependency: BeadDependency;
+interface LinkListProps {
+  label: string;
+  dependencies: readonly BeadDependency[];
+  statuses: readonly BeadStatus[];
   styles: PanelStyles;
   onNavigate: (id: string) => void;
 }
 
-function LinkRow({ dependency, styles, onNavigate }: LinkRowProps) {
-  const handlePress = useCallback(() => onNavigate(dependency.id), [onNavigate, dependency.id]);
+// A bulleted, one-per-line list: status dot · id · title. Stays a list no matter how many
+// there are (long lists were previously wrapping into an unreadable pill blob); past
+// LINK_LIST_CAP the tail collapses behind a "show more" toggle.
+function LinkList({ label, dependencies, statuses, styles, onNavigate }: LinkListProps) {
+  const [expanded, setExpanded] = useState(false);
+  if (dependencies.length === 0) return null;
+  const shown = expanded ? dependencies : dependencies.slice(0, LINK_LIST_CAP);
+  const hidden = dependencies.length - shown.length;
   return (
-    <Pressable accessibilityRole="button" onPress={handlePress}>
-      <View style={styles.linkRow}>
-        <Text style={styles.linkAction} numberOfLines={1}>
-          {dependency.id}
-          {dependency.title ? ` — ${dependency.title}` : ""}
-        </Text>
-      </View>
-    </Pressable>
+    <View style={styles.linkGroup}>
+      <Text style={styles.metaText}>
+        {label} ({dependencies.length})
+      </Text>
+      {shown.map((dependency) => {
+        const dotColor = styles.tone[resolveStatus(dependency.status, statuses).tone].color as string;
+        return (
+          <Pressable
+            key={`${label}-${dependency.id}`}
+            accessibilityRole="button"
+            onPress={() => onNavigate(dependency.id)}
+            style={styles.linkItem}
+          >
+            <View style={[styles.linkDot, { backgroundColor: dotColor }]} />
+            <Text style={styles.linkItemId}>{dependency.id}</Text>
+            {dependency.title ? (
+              <Text style={styles.linkItemTitle} numberOfLines={1}>
+                {dependency.title}
+              </Text>
+            ) : null}
+          </Pressable>
+        );
+      })}
+      {hidden > 0 ? (
+        <Pressable accessibilityRole="button" onPress={() => setExpanded(true)}>
+          <Text style={styles.linkAction}>Show {hidden} more</Text>
+        </Pressable>
+      ) : null}
+    </View>
   );
 }
 
@@ -548,6 +365,8 @@ interface BeadDetailPanelProps {
   issue: BeadIssue;
   projectId: string;
   projectRootPath: string | null;
+  types: readonly string[];
+  statuses: readonly BeadStatus[];
   activeWorkspace: BeadsWorkspace | null;
   isCurrentWorkspace: boolean;
   navigation: PluginNavigation | undefined;
@@ -557,12 +376,20 @@ interface BeadDetailPanelProps {
   onNavigateToBead: (id: string) => void;
 }
 
+// Options for the type/status pickers: always include the bead's current value even if bd
+// didn't list it (e.g. a type removed from config after the bead was created).
+function withCurrent(options: readonly string[], current: string): string[] {
+  return options.includes(current) ? [...options] : [current, ...options];
+}
+
 function BeadDetailPanel({
   theme,
   styles,
   issue,
   projectId,
   projectRootPath,
+  types,
+  statuses,
   activeWorkspace,
   isCurrentWorkspace,
   navigation,
@@ -581,7 +408,10 @@ function BeadDetailPanel({
   const [editDescription, setEditDescription] = useState(issue.description ?? "");
   const [editStatus, setEditStatus] = useState(issue.status);
   const [editPriority, setEditPriority] = useState(issue.priority);
+  const [editType, setEditType] = useState(issue.issueType);
   const [isEditingDescription, setIsEditingDescription] = useState(false);
+  const [descriptionHeight, setDescriptionHeight] = useState(0);
+  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [branchName, setBranchName] = useState("");
   const [baseRef, setBaseRef] = useState("");
@@ -594,11 +424,26 @@ function BeadDetailPanel({
     setEditDescription(issue.description ?? "");
     setEditStatus(issue.status);
     setEditPriority(issue.priority);
+    setEditType(issue.issueType);
     setIsEditingDescription(false);
+    setDescriptionExpanded(false);
     setConfirmingDelete(false);
     setBranchName("");
     setBaseRef("");
   }, [issue.id]);
+
+  // A description longer than this (roughly a screenful) starts collapsed with a toggle,
+  // so a wall of text doesn't bury the LINKS / WORKSPACE sections below it.
+  const descriptionIsLong =
+    editDescription.length > DESC_LONG_CHARS || editDescription.split("\n").length > DESC_LONG_LINES;
+  const descriptionClamped = descriptionIsLong && !descriptionExpanded;
+  const handleToggleDescription = useCallback(() => setDescriptionExpanded((current) => !current), []);
+
+  const statusChoices = useMemo(() => withCurrent(statusOptions(statuses), issue.status), [statuses, issue.status]);
+  const typeChoices = useMemo(
+    () => withCurrent(types.length > 0 ? types : [...FALLBACK_ISSUE_TYPES], issue.issueType),
+    [types, issue.issueType],
+  );
 
   // Resolves the reverse dependency direction ("required by"), which list/update/create
   // never return — only `bd show --include-dependents` does. Cheap, so fetched per expand
@@ -614,15 +459,17 @@ function BeadDetailPanel({
     editTitle !== issue.title ||
     editDescription !== (issue.description ?? "") ||
     editStatus !== issue.status ||
-    editPriority !== issue.priority;
+    editPriority !== issue.priority ||
+    editType !== issue.issueType;
 
   const updateMutation = useMutation({
     mutationFn: async () => {
-      const patch: { title?: string; description?: string; priority?: number; status?: string } = {};
+      const patch: { title?: string; description?: string; priority?: number; status?: string; issueType?: string } = {};
       if (editTitle !== issue.title) patch.title = editTitle;
       if (editDescription !== (issue.description ?? "")) patch.description = editDescription;
       if (editStatus !== issue.status) patch.status = editStatus;
       if (editPriority !== issue.priority) patch.priority = editPriority;
+      if (editType !== issue.issueType) patch.issueType = editType;
       return updateBeadCall({ projectId, id: issue.id, ...patch });
     },
     onSuccess: (result) => {
@@ -750,8 +597,23 @@ function BeadDetailPanel({
         <View>
           <Text style={styles.sectionLabel}>STATUS</Text>
           <View style={styles.sectionRow}>
-            {STATUS_OPTIONS.map((option) => (
-              <Chip key={option} label={option} active={editStatus === option} styles={styles} onSelect={() => setEditStatus(option)} />
+            {statusChoices.map((option) => (
+              <Chip
+                key={option}
+                label={statusLabel(option)}
+                active={editStatus === option}
+                styles={styles}
+                onSelect={() => setEditStatus(option)}
+              />
+            ))}
+          </View>
+        </View>
+
+        <View>
+          <Text style={styles.sectionLabel}>TYPE</Text>
+          <View style={styles.sectionRow}>
+            {typeChoices.map((option) => (
+              <Chip key={option} label={option} active={editType === option} styles={styles} onSelect={() => setEditType(option)} />
             ))}
           </View>
         </View>
@@ -778,22 +640,37 @@ function BeadDetailPanel({
               value={editDescription}
               onChangeText={setEditDescription}
               onBlur={handleBlurDescription}
+              onContentSizeChange={(event) => setDescriptionHeight(event.nativeEvent.contentSize.height)}
               multiline
               autoFocus
               placeholder="No description"
               placeholderTextColor={theme.colors.foregroundMuted}
-              style={styles.fieldInputMultiline}
+              style={[styles.fieldInputMultiline, descriptionHeight > 0 ? { height: Math.max(84, descriptionHeight) } : null]}
             />
           ) : (
-            <Pressable accessibilityRole="button" onPress={handleStartEditingDescription}>
-              <View style={styles.markdownPreview}>
-                {editDescription.trim() ? (
-                  <MarkdownText content={editDescription} theme={theme} />
-                ) : (
-                  <Text style={styles.detail}>No description — tap to add</Text>
-                )}
-              </View>
-            </Pressable>
+            <>
+              <Pressable accessibilityRole="button" onPress={handleStartEditingDescription}>
+                <View
+                  style={[
+                    styles.markdownPreview,
+                    descriptionClamped ? { maxHeight: DESC_COLLAPSED_HEIGHT, overflow: "hidden" } : null,
+                  ]}
+                >
+                  {editDescription.trim() ? (
+                    <MarkdownText content={editDescription} theme={theme} />
+                  ) : (
+                    <Text style={styles.detail}>No description — tap to add</Text>
+                  )}
+                </View>
+              </Pressable>
+              {descriptionIsLong ? (
+                <Pressable accessibilityRole="button" onPress={handleToggleDescription} style={{ paddingTop: SPACE[1] }}>
+                  <Text style={styles.linkAction}>
+                    {descriptionExpanded ? "Show less" : "Show full description"}
+                  </Text>
+                </Pressable>
+              ) : null}
+            </>
           )}
         </View>
 
@@ -809,29 +686,25 @@ function BeadDetailPanel({
           </View>
         ) : null}
 
-        <Text style={styles.metaText}>
-          {issue.issueType} · updated {formatRelativeDate(issue.updatedAt)}
-        </Text>
+        <Text style={styles.metaText}>updated {formatRelativeDate(issue.updatedAt)}</Text>
 
         {dependencies.length > 0 || dependents.length > 0 ? (
           <View style={styles.panelBody}>
             <Text style={styles.sectionLabel}>LINKS</Text>
-            {dependencies.length > 0 ? (
-              <View style={styles.linkGroup}>
-                <Text style={styles.metaText}>Depends on</Text>
-                {dependencies.map((dependency) => (
-                  <LinkRow key={`dep-${dependency.id}`} dependency={dependency} styles={styles} onNavigate={onNavigateToBead} />
-                ))}
-              </View>
-            ) : null}
-            {dependents.length > 0 ? (
-              <View style={styles.linkGroup}>
-                <Text style={styles.metaText}>Required by</Text>
-                {dependents.map((dependency) => (
-                  <LinkRow key={`rdep-${dependency.id}`} dependency={dependency} styles={styles} onNavigate={onNavigateToBead} />
-                ))}
-              </View>
-            ) : null}
+            <LinkList
+              label="Depends on"
+              dependencies={dependencies}
+              statuses={statuses}
+              styles={styles}
+              onNavigate={onNavigateToBead}
+            />
+            <LinkList
+              label="Required by"
+              dependencies={dependents}
+              statuses={statuses}
+              styles={styles}
+              onNavigate={onNavigateToBead}
+            />
           </View>
         ) : null}
 
@@ -880,20 +753,30 @@ interface BeadCreatePanelProps {
   theme: PluginTheme;
   styles: PanelStyles;
   projectId: string;
+  types: readonly string[];
   onClose: () => void;
   onCreated: (issue: BeadIssue) => void;
 }
 
-function BeadCreatePanel({ theme, styles, projectId, onClose, onCreated }: BeadCreatePanelProps) {
+function BeadCreatePanel({ theme, styles, projectId, types, onClose, onCreated }: BeadCreatePanelProps) {
   const toast = useToast();
   const createBeadCall = useRpc(createBeadRpc);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [descriptionHeight, setDescriptionHeight] = useState(0);
   const [priority, setPriority] = useState(2);
+  const [issueType, setIssueType] = useState<string>("task");
+  const typeChoices = types.length > 0 ? types : [...FALLBACK_ISSUE_TYPES];
 
   const createMutation = useMutation({
     mutationFn: () =>
-      createBeadCall({ projectId, title: title.trim(), description: description.trim() || undefined, priority }),
+      createBeadCall({
+        projectId,
+        title: title.trim(),
+        description: description.trim() || undefined,
+        priority,
+        issueType,
+      }),
     onSuccess: (result) => {
       if (result.error || !result.issue) {
         toast.error(result.error ?? "Failed to create bead");
@@ -932,6 +815,15 @@ function BeadCreatePanel({ theme, styles, projectId, onClose, onCreated }: BeadC
         </View>
 
         <View>
+          <Text style={styles.sectionLabel}>TYPE</Text>
+          <View style={styles.sectionRow}>
+            {typeChoices.map((option) => (
+              <Chip key={option} label={option} active={issueType === option} styles={styles} onSelect={() => setIssueType(option)} />
+            ))}
+          </View>
+        </View>
+
+        <View>
           <Text style={styles.sectionLabel}>PRIORITY</Text>
           <View style={styles.sectionRow}>
             {PRIORITY_VALUES.map((value) => (
@@ -945,10 +837,11 @@ function BeadCreatePanel({ theme, styles, projectId, onClose, onCreated }: BeadC
           <TextInput
             value={description}
             onChangeText={setDescription}
+            onContentSizeChange={(event) => setDescriptionHeight(event.nativeEvent.contentSize.height)}
             multiline
             placeholder="Optional details"
             placeholderTextColor={theme.colors.foregroundMuted}
-            style={styles.fieldInputMultiline}
+            style={[styles.fieldInputMultiline, descriptionHeight > 0 ? { height: Math.max(84, descriptionHeight) } : null]}
           />
         </View>
 
@@ -967,6 +860,25 @@ function BeadCreatePanel({ theme, styles, projectId, onClose, onCreated }: BeadC
   );
 }
 
+// Placeholder rows shown while the first list request is in flight — reads as "a table is
+// loading here" instead of a bare centred spinner.
+function SkeletonTable({ styles, theme }: { styles: PanelStyles; theme: PluginTheme }) {
+  return (
+    <View style={styles.table}>
+      <View style={styles.headerRow}>
+        <View style={[styles.skeletonBar, { width: 60 }]} />
+      </View>
+      {[0, 1, 2, 3, 4, 5].map((index) => (
+        <View key={index} style={[styles.row, index > 0 ? styles.rowBordered : null]}>
+          <Icon name="Circle" size={14} color={theme.colors.border} />
+          <View style={[styles.skeletonBar, { width: 72, marginLeft: SPACE[3] }]} />
+          <View style={[styles.skeletonBar, { flex: 1, marginLeft: SPACE[3], maxWidth: 260 }]} />
+        </View>
+      ))}
+    </View>
+  );
+}
+
 export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: PluginWorkspacePanelProps) {
   const paseo = usePaseo();
   const workspaceInfo = useWorkspace(workspaceId, (workspace) => ({
@@ -977,6 +889,9 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
   const projectRootPath = workspaceInfo?.projectRootPath ?? null;
 
   const listBeads = useRpc(listBeadsRpc);
+  const initBeadsCall = useRpc(initBeadsRpc);
+  const beadsMetaCall = useRpc(beadsMetaRpc);
+  const toast = useToast();
   const styles = useMemo(() => buildStyles(theme, layout.compact), [theme, layout.compact]);
 
   const beadsQuery = useQuery({
@@ -987,6 +902,16 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
     refetchOnWindowFocus: true,
   });
   const refetchBeads = beadsQuery.refetch;
+
+  // Type/status vocabularies rarely change — fetch once per mount, no polling.
+  const metaQuery = useQuery({
+    queryKey: ["beads-meta", projectId],
+    queryFn: () => beadsMetaCall({ projectId: projectId ?? "" }),
+    enabled: Boolean(projectId),
+    staleTime: 5 * 60_000,
+  });
+  const types = metaQuery.data?.types ?? [];
+  const statuses = metaQuery.data?.statuses ?? [];
 
   const workspacesQuery = useQuery({
     queryKey: ["beads-workspaces", projectId],
@@ -1001,8 +926,43 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
   const [query, setQuery] = useState("");
   const [sortField, setSortField] = useState<SortField>("priority");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const [grouped, setGrouped] = useState(false);
+  const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [panelWidth, setPanelWidth] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+
+  const handleToggleGrouped = useCallback(() => setGrouped((current) => !current), []);
+  const handleToggleCollapse = useCallback((id: string) => {
+    setCollapsedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const handleTableLayout = useCallback((event: LayoutChangeEvent) => {
+    setPanelWidth(event.nativeEvent.layout.width);
+  }, []);
+  const handleClearFilter = useCallback((key: FilterKey) => {
+    setQuery((current) => stringifySearch(dropFilter(parseSearch(current), key)));
+  }, []);
+
+  const initMutation = useMutation({
+    mutationFn: () => initBeadsCall({ projectId: projectId ?? "" }),
+    onSuccess: (result) => {
+      if (!result.ok) {
+        toast.error(result.error ?? "Failed to run `bd init`");
+        return;
+      }
+      toast.show("Beads initialized", { variant: "success" });
+      void refetchBeads();
+    },
+    onError: (error: unknown) => {
+      toast.error(error instanceof Error ? error.message : "Failed to run `bd init`");
+    },
+  });
+  const handleInit = useCallback(() => initMutation.mutate(), [initMutation]);
 
   const handleSort = useCallback((field: SortField) => {
     setSortField((currentField) => {
@@ -1044,10 +1004,44 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
   }, [refetchBeads, refetchWorkspaces]);
 
   const allIssues = beadsQuery.data?.issues ?? [];
-  const visibleIssues = useMemo(
-    () => sortBeads(allIssues.filter((issue) => matchesQuery(issue, query)), sortField, sortDirection),
-    [allIssues, query, sortField, sortDirection],
+  const debouncedQuery = useDebouncedValue(query, 200);
+  const search = useMemo(() => parseSearch(debouncedQuery), [debouncedQuery]);
+  const matchCount = useMemo(
+    () => (query.trim() ? allIssues.filter((issue) => matchesSearch(issue, search)).length : allIssues.length),
+    [allIssues, search, query],
   );
+  const rows = useMemo(
+    () =>
+      grouped
+        ? buildGroupedRows(allIssues, search, sortField, sortDirection, collapsedIds)
+        : buildFlatRows(allIssues, search, sortField, sortDirection),
+    [allIssues, search, sortField, sortDirection, grouped, collapsedIds],
+  );
+
+  // Drop the low-priority columns first as the panel narrows (e.g. docked in the sidebar).
+  // `panelWidth === 0` is the pre-measure first paint — show everything rather than flash
+  // a stripped-down table.
+  const visibleColumns = useMemo(
+    () => COLUMNS.filter((column) => panelWidth === 0 || panelWidth >= (COLUMN_MIN_WIDTH[column.key] ?? 0)),
+    [panelWidth],
+  );
+  const compactStatus = panelWidth > 0 && panelWidth <= STATUS_GLYPH_MAX_WIDTH;
+  const cellContext = useMemo<CellContext>(() => ({ styles, statuses, compactStatus }), [styles, statuses, compactStatus]);
+
+  // Width the id column needs to show its longest visible id in full — the id is never
+  // truncated, so the column is sized to content (mono ≈ 8px/char at 12px + gutter).
+  const idColumnWidth = useMemo(() => {
+    const longest = rows.reduce((max, row) => Math.max(max, row.issue.id.length), 2);
+    return Math.min(260, Math.max(48, longest * 8 + SPACE[3]));
+  }, [rows]);
+
+  // Fixed leading gutter for the grouped tree: wide enough for the deepest chevron. Shared
+  // by the header and every row so data columns never drift with nesting depth.
+  const treeColumnWidth = useMemo(() => {
+    if (!grouped) return 0;
+    const maxDepth = rows.reduce((max, row) => Math.max(max, row.depth), 0);
+    return Math.min(120, maxDepth * TREE_INDENT + 22);
+  }, [grouped, rows]);
 
   const available = Boolean(beadsQuery.data?.available);
   const showStaleErrorBanner = beadsQuery.isError && allIssues.length > 0;
@@ -1056,25 +1050,72 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
   if (!projectId) {
     content = <Text style={styles.detail}>No project for this workspace</Text>;
   } else if (beadsQuery.isPending) {
-    content = <ActivityIndicator color={theme.colors.foregroundMuted} />;
+    content = <SkeletonTable styles={styles} theme={theme} />;
   } else if (!available) {
-    content = <Text style={styles.detail}>{beadsQuery.data?.error ?? "Beads is not set up for this project. Run `bd init` in its root checkout."}</Text>;
-  } else if (visibleIssues.length === 0) {
-    content = <Text style={styles.detail}>{query ? "No matching beads" : "No beads yet"}</Text>;
+    content = (
+      <View style={{ gap: SPACE[3] }}>
+        <Text style={styles.detail}>
+          {beadsQuery.data?.error ?? "Beads is not set up for this project. Run `bd init` in its root checkout."}
+        </Text>
+        {projectId ? (
+          <View style={styles.actionRow}>
+            <Button
+              label={initMutation.isPending ? "Running bd init..." : "Run bd init"}
+              variant="primary"
+              styles={styles}
+              icon="Play"
+              onPress={handleInit}
+              disabled={initMutation.isPending}
+            />
+          </View>
+        ) : null}
+        {projectRootPath ? (
+          <Text style={styles.metaText}>Runs `bd init --non-interactive` in {projectRootPath}</Text>
+        ) : null}
+      </View>
+    );
+  } else if (rows.length === 0) {
+    content = (
+      <Text style={styles.detail}>{query.trim() ? "No beads match your search." : "No beads yet"}</Text>
+    );
   } else {
     content = (
-      <View style={styles.table}>
+      <View style={styles.table} onLayout={handleTableLayout}>
         <View style={styles.headerRow}>
-          {COLUMNS.map((column) => (
-            <ColumnHeader key={column.key} column={column} sortField={sortField} sortDirection={sortDirection} styles={styles} theme={theme} onSort={handleSort} />
+          {grouped ? <View style={{ width: treeColumnWidth }} /> : null}
+          {visibleColumns.map((column) => (
+            <ColumnHeader
+              key={column.key}
+              column={column}
+              sortField={sortField}
+              sortDirection={sortDirection}
+              idColumnWidth={idColumnWidth}
+              styles={styles}
+              theme={theme}
+              onSort={handleSort}
+            />
           ))}
         </View>
-        {visibleIssues.map((issue, index) => {
+        {rows.map((row, index) => {
+          const { issue } = row;
           const isExpanded = expandedId === issue.id;
           const activeWorkspace = findActiveWorkspace(issue, workspaces);
           return (
             <Fragment key={issue.id}>
-              <BeadRow issue={issue} bordered={index > 0} selected={isExpanded} styles={styles} onPress={handleRowPress} />
+              <BeadRow
+                row={row}
+                columns={visibleColumns}
+                idColumnWidth={idColumnWidth}
+                treeColumnWidth={treeColumnWidth}
+                cellContext={cellContext}
+                bordered={index > 0}
+                selected={isExpanded}
+                grouped={grouped}
+                styles={styles}
+                theme={theme}
+                onPress={handleRowPress}
+                onToggleCollapse={handleToggleCollapse}
+              />
               {isExpanded ? (
                 <BeadDetailPanel
                   theme={theme}
@@ -1082,6 +1123,8 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
                   issue={issue}
                   projectId={projectId}
                   projectRootPath={projectRootPath}
+                  types={types}
+                  statuses={statuses}
                   activeWorkspace={activeWorkspace}
                   isCurrentWorkspace={activeWorkspace?.id === workspaceId}
                   navigation={navigation}
@@ -1100,36 +1143,74 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ gap: SPACE[3] }}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Beads</Text>
-        <Text style={styles.refreshLabel}>{pluralize(allIssues.length, "issue")}</Text>
-      </View>
       {showStaleErrorBanner ? (
         <View style={styles.errorBanner}>
           <Text style={styles.errorBannerText}>Couldn't refresh beads. Showing the last known list.</Text>
         </View>
       ) : null}
       {available ? (
-        <View style={styles.toolbar}>
-          <View style={styles.searchWrap}>
-            <View style={styles.searchIcon}>
-              <Icon name="Search" size={14} color={theme.colors.foregroundMuted} />
+        <View style={{ gap: SPACE[2] }}>
+          <View style={styles.toolbar}>
+            <View style={styles.searchWrap}>
+              <View style={styles.searchIcon}>
+                <Icon name="Search" size={14} color={theme.colors.foregroundMuted} />
+              </View>
+              <TextInput
+                value={query}
+                onChangeText={setQuery}
+                placeholder="Search or filter — e.g. type:bug p1"
+                placeholderTextColor={theme.colors.foregroundMuted}
+                style={styles.searchInput}
+              />
             </View>
-            <TextInput
-              value={query}
-              onChangeText={setQuery}
-              placeholder="Search by id or title"
-              placeholderTextColor={theme.colors.foregroundMuted}
-              style={styles.searchInput}
+            <Button
+              label="Group"
+              variant={grouped ? "secondary" : "ghost"}
+              styles={styles}
+              onPress={handleToggleGrouped}
+              icon="ListTree"
             />
+            <Button label="New" variant="primary" styles={styles} onPress={handleToggleCreate} icon="Plus" />
           </View>
-          <Button label="New bead" variant="primary" styles={styles} onPress={handleToggleCreate} icon="Plus" />
+          {hasActiveFilters(search) ? (
+            <View style={styles.filterChipRow}>
+              {FILTER_KEYS.filter((key) => search.filters[key]).map((key) => (
+                <Pressable
+                  key={key}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove filter ${key}:${search.filters[key]}`}
+                  onPress={() => handleClearFilter(key)}
+                >
+                  <View style={styles.filterChip}>
+                    <Text style={styles.filterChipText}>
+                      {key}:{search.filters[key]}
+                    </Text>
+                    <Icon name="X" size={12} color={theme.colors.foregroundMuted} />
+                  </View>
+                </Pressable>
+              ))}
+            </View>
+          ) : null}
         </View>
       ) : null}
       {creating && projectId ? (
-        <BeadCreatePanel theme={theme} styles={styles} projectId={projectId} onClose={handleCloseCreate} onCreated={handleIssueCreated} />
+        <BeadCreatePanel
+          theme={theme}
+          styles={styles}
+          projectId={projectId}
+          types={types}
+          onClose={handleCloseCreate}
+          onCreated={handleIssueCreated}
+        />
       ) : null}
       {content}
+      {available && allIssues.length > 0 ? (
+        <Text style={styles.footerCount}>
+          {matchCount === allIssues.length
+            ? pluralize(allIssues.length, "issue")
+            : `${matchCount} of ${allIssues.length} issues`}
+        </Text>
+      ) : null}
     </ScrollView>
   );
 }

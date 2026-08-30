@@ -18,6 +18,9 @@ export const BeadIssueSchema = z.object({
   priority: z.number(), // 0 (highest) .. 4 (lowest)
   issueType: z.string(),
   assignee: z.string().nullable(),
+  /** Direct parent issue id (the `parent-child` dependency), or null for a top-level
+   * issue. Drives the epic-nested tree view. */
+  parent: z.string().nullable(),
   dependencyCount: z.number(),
   dependentCount: z.number(),
   commentCount: z.number(),
@@ -51,6 +54,7 @@ export const updateBeadRpc = defineRpc({
     description: z.string().optional(),
     priority: z.number().min(0).max(4).optional(),
     status: z.string().optional(),
+    issueType: z.string().optional(),
     externalRef: z.string().optional(),
   }),
   output: z.object({
@@ -61,6 +65,28 @@ export const updateBeadRpc = defineRpc({
 
 export type UpdateBeadResult = z.output<typeof updateBeadRpc.output>;
 
+export const BeadStatusSchema = z.object({
+  name: z.string(),
+  icon: z.string(),
+  category: z.string(),
+});
+export type BeadStatus = z.output<typeof BeadStatusSchema>;
+
+/** The type/status vocabularies `bd` recognizes for this project — built-ins plus anything
+ * added via `bd config set types.custom` / `status.custom`. Fetched once (rarely changes)
+ * so the create/edit forms offer exactly what the CLI would accept. */
+export const beadsMetaRpc = defineRpc({
+  name: "beads.meta",
+  input: z.object({ projectId: z.string() }),
+  output: z.object({
+    types: z.array(z.string()),
+    statuses: z.array(BeadStatusSchema),
+    error: z.string().nullable(),
+  }),
+});
+
+export type BeadsMetaResult = z.output<typeof beadsMetaRpc.output>;
+
 export const createBeadRpc = defineRpc({
   name: "beads.create",
   input: z.object({
@@ -68,6 +94,7 @@ export const createBeadRpc = defineRpc({
     title: z.string().min(1),
     description: z.string().optional(),
     priority: z.number().min(0).max(4).optional(),
+    issueType: z.string().optional(),
   }),
   output: z.object({
     issue: BeadIssueSchema.nullable(),
@@ -76,6 +103,17 @@ export const createBeadRpc = defineRpc({
 });
 
 export type CreateBeadResult = z.output<typeof createBeadRpc.output>;
+
+export const initBeadsRpc = defineRpc({
+  name: "beads.init",
+  input: z.object({ projectId: z.string() }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
+export type InitBeadsResult = z.output<typeof initBeadsRpc.output>;
 
 export const getBeadRpc = defineRpc({
   name: "beads.get",

@@ -1,7 +1,15 @@
 import type { PluginContext } from "@getpaseo/plugin";
 import { BeadsWorkspacePanel } from "./beads.client";
-import { createBead, deleteBead, getBead, listBeads, updateBead } from "./beads.server";
-import { createBeadRpc, deleteBeadRpc, getBeadRpc, listBeadsRpc, updateBeadRpc } from "./beads.shared";
+import { beadsMeta, createBead, deleteBead, getBead, initBead, listBeads, updateBead } from "./beads.server";
+import {
+  beadsMetaRpc,
+  createBeadRpc,
+  deleteBeadRpc,
+  getBeadRpc,
+  initBeadsRpc,
+  listBeadsRpc,
+  updateBeadRpc,
+} from "./beads.shared";
 
 export default function contribute(plugin: PluginContext) {
   plugin.handle(listBeadsRpc, listBeads);
@@ -9,6 +17,8 @@ export default function contribute(plugin: PluginContext) {
   plugin.handle(createBeadRpc, createBead);
   plugin.handle(getBeadRpc, getBead);
   plugin.handle(deleteBeadRpc, deleteBead);
+  plugin.handle(initBeadsRpc, initBead);
+  plugin.handle(beadsMetaRpc, beadsMeta);
 
   // Scoped to whichever workspace you're in, auto-resolved from its project.
   plugin.addWorkspacePanel({
