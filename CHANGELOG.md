@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.2
+
+### Changed
+- Migrated to the Paseo v0.8 plugin runtime entries: `index.ts` split into `index.client.tsx`
+  and `index.server.ts`, modules moved under `client/`, `server/` and `shared/`, SDK types
+  now come from `@getpaseo/plugin` instead of a vendored `paseo-plugin.d.ts`
+- Requires Paseo ≥ 0.8.0 (`requirements.paseo` in `paseo-plugin.json`)
+
 ## 0.0.1
 
 ### Added

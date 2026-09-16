@@ -1,5 +1,5 @@
-import type { BeadIssue, BeadStatus } from "./beads.shared";
-import type { Tone } from "./beads.theme";
+import type { BeadIssue, BeadStatus } from "../shared/beads";
+import type { Tone } from "./theme";
 
 // Pure view-model logic for the Beads panel: search parsing, filtering, sorting, the
 // epic-nested tree, and the small status/type/priority lookups. No React, no react-native.

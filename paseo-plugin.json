@@ -1,3 +1,6 @@
 {
-  "id": "beads"
+  "id": "beads",
+  "requirements": {
+    "paseo": ">=0.8.0"
+  }
 }

@@ -1,6 +1,7 @@
-import type { PluginTheme, PluginWorkspacePanelProps } from "@getpaseo/plugin";
-import { useRpc, usePaseo, useWorkspace } from "@getpaseo/plugin";
-import { Icon, useToast } from "@getpaseo/plugin/react-native";
+import type { PluginTheme } from "@getpaseo/plugin";
+import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
+import { useRpc, usePaseo, useWorkspace } from "@getpaseo/plugin/client";
+import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -26,7 +27,7 @@ import {
   type BeadDependency,
   type BeadIssue,
   type BeadStatus,
-} from "./beads.shared";
+} from "../shared/beads";
 import {
   FONT_SIZE,
   RADIUS,
@@ -35,7 +36,7 @@ import {
   buildStyles,
   hoverTitle,
   type PanelStyles,
-} from "./beads.theme";
+} from "./theme";
 import {
   COLUMNS,
   COLUMN_MIN_WIDTH,
@@ -66,7 +67,7 @@ import {
   type SortDirection,
   type SortField,
   type TreeRow,
-} from "./beads.view";
+} from "./view";
 
 // Ahead of the currently published SDK (getpaseo/paseo#3901) — optional so this degrades
 // to plain text on hosts that don't populate it yet.

@@ -63,5 +63,6 @@ paseo plugin add pasteley/paseo-beads
 
 ## Requirements
 
+- Paseo ≥ 0.8.0
 - Node ≥ 22 (for `Promise.withResolvers`)
 - `bd` on `PATH` (or set `BD_BINARY` to an absolute path)

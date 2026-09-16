@@ -10,7 +10,7 @@ import {
   isBeadsInitialized,
   listIssues,
   updateIssue,
-} from "./bd.server";
+} from "./bd";
 import type {
   BeadsMetaResult,
   CreateBeadResult,
@@ -26,7 +26,7 @@ import type {
   initBeadsRpc,
   listBeadsRpc,
   updateBeadRpc,
-} from "./beads.shared";
+} from "../shared/beads";
 
 async function resolveProjectRoot(
   paseo: PluginHandlerContext["paseo"],

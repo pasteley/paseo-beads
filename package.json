@@ -1,14 +1,15 @@
 {
   "name": "paseo-beads",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Paseo plugin: cross-project bead (bd) tracker view, correlated with Paseo workspace state.",
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@getpaseo/client": "^0.7.0-beta.2",
-    "@getpaseo/protocol": "^0.7.0-beta.2",
+    "@getpaseo/client": "0.8.0",
+    "@getpaseo/plugin": "0.8.0",
+    "@getpaseo/protocol": "0.8.0",
     "@tanstack/react-query": "^5.90.11",
     "@types/node": "^22.13.0",
     "@types/react": "~19.2.0",
