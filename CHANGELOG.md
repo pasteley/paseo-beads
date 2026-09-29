@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.0.3
+
+### Added
+- **Live updates** — the server follows bd's events journal instead of re-running `bd list` on a
+  timer, so a change made by an agent or in a terminal shows up in about a second. Needs bd ≥
+  1.3.0 with `events-journal` on; the footer says **Live**, or offers the button that turns it on
+- **Guarded edits**: saving over a bead someone else moved since you opened it is refused and
+  reloaded instead of overwriting it
+- Optional `bd serve` transport (`BD_SERVE_URL`, `BD_SERVE_TOKEN`): reads, writes and the journal
+  go over loopback HTTP with no `bd` process per call. Needs a Dolt server-mode workspace; falls
+  back to the CLI with a notice
+
+### Changed
+- Opening a bead no longer waits on `bd show` — one list read carries its text and both
+  dependency directions, the reverse one indexed on the server
+- Far fewer `bd` processes: reads are served from the cache, `beads.list` answers `unchanged` when
+  nothing moved, and the database probe, version check and type/status vocabularies are no longer
+  re-run per read
+- Targets bd ≥ 1.3.0; older versions keep working on the previous 5s polling and the panel says so
+- List limit raised from 200 to 1000 issues
+
 ## 0.0.2
 
 ### Changed

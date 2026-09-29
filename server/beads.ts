@@ -1,20 +1,12 @@
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import type { output as ZodOutput } from "zod";
-import {
-  BeadsUnavailableError,
-  createIssue,
-  deleteIssue,
-  getBeadsMeta,
-  getIssue,
-  initBeads,
-  isBeadsInitialized,
-  listIssues,
-  updateIssue,
-} from "./bd";
+import { BeadsConflictError, BeadsUnavailableError } from "./bd";
+import { getBeadsFeed } from "./feed";
 import type {
   BeadsMetaResult,
   CreateBeadResult,
   DeleteBeadResult,
+  EnableBeadEventsResult,
   GetBeadResult,
   InitBeadsResult,
   ListBeadsResult,
@@ -22,11 +14,24 @@ import type {
   beadsMetaRpc,
   createBeadRpc,
   deleteBeadRpc,
+  enableBeadEventsRpc,
   getBeadRpc,
   initBeadsRpc,
   listBeadsRpc,
   updateBeadRpc,
 } from "../shared/beads";
+
+/** Early returns never reach a feed, so they have nothing to report about bd. */
+const NO_FEED = {
+  revision: 0,
+  unchanged: false,
+  mode: "poll",
+  transport: "cli",
+  bdVersion: null,
+  supportsEvents: false,
+  journalEnabled: false,
+  transportError: null,
+} as const;
 
 async function resolveProjectRoot(
   paseo: PluginHandlerContext["paseo"],
@@ -36,30 +41,57 @@ async function resolveProjectRoot(
   return projects.find((entry) => entry.projectId === projectId)?.projectRootPath ?? null;
 }
 
+function message(error: unknown, fallback: string): string {
+  return error instanceof BeadsUnavailableError ? error.message : fallback;
+}
+
 export async function listBeads(
-  { projectId }: ZodOutput<typeof listBeadsRpc.input>,
+  { projectId, sinceRevision }: ZodOutput<typeof listBeadsRpc.input>,
   { paseo }: PluginHandlerContext,
 ): Promise<ListBeadsResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
   if (!projectRootPath) {
-    return { available: false, issues: [], error: "Project not found." };
+    return { ...NO_FEED, available: false, issues: [], error: "Project not found." };
   }
 
-  const available = await isBeadsInitialized(projectRootPath);
-  if (!available) {
+  const snapshot = await getBeadsFeed(projectRootPath).snapshot();
+  if (!snapshot.available) {
     return {
+      ...NO_FEED,
       available: false,
       issues: [],
-      error: "No bd database found for this project. Run `bd init` in its root checkout.",
+      error: snapshot.error ?? "No bd database found for this project. Run `bd init` in its root checkout.",
     };
   }
 
+  const unchanged = sinceRevision !== undefined && sinceRevision === snapshot.revision;
+  return {
+    available: true,
+    issues: unchanged ? [] : snapshot.issues,
+    error: snapshot.error,
+    revision: snapshot.revision,
+    unchanged,
+    mode: snapshot.mode,
+    transport: snapshot.transport,
+    bdVersion: snapshot.bdVersion,
+    supportsEvents: snapshot.supportsEvents,
+    journalEnabled: snapshot.journalEnabled,
+    transportError: snapshot.transportError,
+  };
+}
+
+export async function enableBeadEvents(
+  { projectId }: ZodOutput<typeof enableBeadEventsRpc.input>,
+  { paseo }: PluginHandlerContext,
+): Promise<EnableBeadEventsResult> {
+  const projectRootPath = await resolveProjectRoot(paseo, projectId);
+  if (!projectRootPath) return { ok: false, error: "Project not found." };
+
   try {
-    const issues = await listIssues(projectRootPath, { all: true });
-    return { available: true, issues, error: null };
+    await getBeadsFeed(projectRootPath).enableEvents();
+    return { ok: true, error: null };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to list beads.";
-    return { available: true, issues: [], error: message };
+    return { ok: false, error: message(error, "Failed to enable the bd events journal.") };
   }
 }
 
@@ -68,20 +100,17 @@ export async function initBead(
   { paseo }: PluginHandlerContext,
 ): Promise<InitBeadsResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
-  if (!projectRootPath) {
-    return { ok: false, error: "Project not found." };
-  }
+  if (!projectRootPath) return { ok: false, error: "Project not found." };
 
-  if (await isBeadsInitialized(projectRootPath)) {
-    return { ok: true, error: null };
-  }
+  const feed = getBeadsFeed(projectRootPath);
+  if ((await feed.snapshot()).available) return { ok: true, error: null };
 
   try {
-    await initBeads(projectRootPath);
+    await (await feed.resolve()).init();
+    await feed.reload();
     return { ok: true, error: null };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to run `bd init`.";
-    return { ok: false, error: message };
+    return { ok: false, error: message(error, "Failed to run `bd init`.") };
   }
 }
 
@@ -90,16 +119,12 @@ export async function beadsMeta(
   { paseo }: PluginHandlerContext,
 ): Promise<BeadsMetaResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
-  if (!projectRootPath) {
-    return { types: [], statuses: [], error: "Project not found." };
-  }
+  if (!projectRootPath) return { types: [], statuses: [], error: "Project not found." };
 
   try {
-    const meta = await getBeadsMeta(projectRootPath);
-    return { ...meta, error: null };
+    return { ...(await getBeadsFeed(projectRootPath).vocabulary()), error: null };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to load bd types/statuses.";
-    return { types: [], statuses: [], error: message };
+    return { types: [], statuses: [], error: message(error, "Failed to load bd types/statuses.") };
   }
 }
 
@@ -108,16 +133,21 @@ export async function updateBead(
   { paseo }: PluginHandlerContext,
 ): Promise<UpdateBeadResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
-  if (!projectRootPath) {
-    return { issue: null, error: "Project not found." };
-  }
+  if (!projectRootPath) return { issue: null, error: "Project not found.", conflict: false };
 
+  const feed = getBeadsFeed(projectRootPath);
   try {
-    const issue = await updateIssue(projectRootPath, id, patch);
-    return { issue, error: null };
+    const backend = await feed.resolve();
+    const issue = await backend.update(id, feed.supportsGuards ? patch : { ...patch, ifStatus: undefined });
+    feed.applyWrite(issue);
+    return { issue, error: null, conflict: false };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to update bead.";
-    return { issue: null, error: message };
+    if (error instanceof BeadsConflictError) {
+      // The panel reloads rather than re-applies: what it was editing is out of date.
+      void feed.refresh();
+      return { issue: null, error: error.message, conflict: true };
+    }
+    return { issue: null, error: message(error, "Failed to update bead."), conflict: false };
   }
 }
 
@@ -126,16 +156,15 @@ export async function createBead(
   { paseo }: PluginHandlerContext,
 ): Promise<CreateBeadResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
-  if (!projectRootPath) {
-    return { issue: null, error: "Project not found." };
-  }
+  if (!projectRootPath) return { issue: null, error: "Project not found." };
 
+  const feed = getBeadsFeed(projectRootPath);
   try {
-    const issue = await createIssue(projectRootPath, patch);
+    const issue = await (await feed.resolve()).create(patch);
+    feed.applyWrite(issue);
     return { issue, error: null };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to create bead.";
-    return { issue: null, error: message };
+    return { issue: null, error: message(error, "Failed to create bead.") };
   }
 }
 
@@ -144,16 +173,15 @@ export async function getBead(
   { paseo }: PluginHandlerContext,
 ): Promise<GetBeadResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
-  if (!projectRootPath) {
-    return { issue: null, error: "Project not found." };
-  }
+  if (!projectRootPath) return { issue: null, error: "Project not found." };
 
+  const feed = getBeadsFeed(projectRootPath);
   try {
-    const issue = await getIssue(projectRootPath, id);
+    const issue = await (await feed.resolve()).get(id);
+    feed.applyDetail(issue);
     return { issue, error: null };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to load bead.";
-    return { issue: null, error: message };
+    return { issue: null, error: message(error, "Failed to load bead.") };
   }
 }
 
@@ -162,15 +190,14 @@ export async function deleteBead(
   { paseo }: PluginHandlerContext,
 ): Promise<DeleteBeadResult> {
   const projectRootPath = await resolveProjectRoot(paseo, projectId);
-  if (!projectRootPath) {
-    return { deleted: false, error: "Project not found." };
-  }
+  if (!projectRootPath) return { deleted: false, error: "Project not found." };
 
+  const feed = getBeadsFeed(projectRootPath);
   try {
-    await deleteIssue(projectRootPath, id);
+    await (await feed.resolve()).remove(id);
+    feed.applyDelete(id);
     return { deleted: true, error: null };
   } catch (error) {
-    const message = error instanceof BeadsUnavailableError ? error.message : "Failed to delete bead.";
-    return { deleted: false, error: message };
+    return { deleted: false, error: message(error, "Failed to delete bead.") };
   }
 }

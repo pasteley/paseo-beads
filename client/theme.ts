@@ -36,6 +36,8 @@ interface ButtonVariantStyles {
 export interface PanelStyles {
   screen: ViewStyle;
   footerCount: TextStyle;
+  footerRow: ViewStyle;
+  feedStatus: ViewStyle;
   toolbar: ViewStyle;
   searchWrap: ViewStyle;
   searchIcon: ViewStyle;
@@ -43,6 +45,8 @@ export interface PanelStyles {
   detail: TextStyle;
   errorBanner: ViewStyle;
   errorBannerText: TextStyle;
+  noticeBanner: ViewStyle;
+  noticeBannerText: TextStyle;
   table: ViewStyle;
   headerRow: ViewStyle;
   headerCell: ViewStyle;
@@ -92,6 +96,8 @@ export function buildStyles(theme: PluginTheme, compact: boolean): PanelStyles {
   return {
     screen: { flex: 1, padding: compact ? SPACE[3] : SPACE[4], backgroundColor: colors.surface0, gap: SPACE[3] },
     footerCount: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm, paddingHorizontal: SPACE[1] },
+    footerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: SPACE[2] },
+    feedStatus: { flexDirection: "row", alignItems: "center", gap: SPACE[1] },
     toolbar: { flexDirection: "row", alignItems: "center", gap: SPACE[2] },
     searchWrap: { flex: 1, justifyContent: "center" },
     searchIcon: { position: "absolute", left: SPACE[2], zIndex: 1 },
@@ -117,6 +123,15 @@ export function buildStyles(theme: PluginTheme, compact: boolean): PanelStyles {
       gap: SPACE[2],
     },
     errorBannerText: { color: colors.statusDanger, fontSize: FONT_SIZE.sm },
+    noticeBanner: {
+      borderWidth: 1,
+      borderColor: colors.statusWarning,
+      borderRadius: RADIUS.lg,
+      padding: SPACE[3],
+      backgroundColor: colors.surface1,
+      gap: SPACE[2],
+    },
+    noticeBannerText: { color: colors.foregroundMuted, fontSize: FONT_SIZE.sm },
     table: { borderWidth: 1, borderColor: colors.border, borderRadius: RADIUS.lg, overflow: "hidden" },
     headerRow: {
       flexDirection: "row",

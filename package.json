@@ -1,7 +1,7 @@
 {
   "name": "paseo-beads",
   "private": true,
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Paseo plugin: cross-project bead (bd) tracker view, correlated with Paseo workspace state.",
   "scripts": {
     "typecheck": "tsc --noEmit"

@@ -3,7 +3,7 @@ import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { useRpc, usePaseo, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type GestureResponderEvent,
   type LayoutChangeEvent,
@@ -20,13 +20,18 @@ import {
   beadsMetaRpc,
   createBeadRpc,
   deleteBeadRpc,
+  enableBeadEventsRpc,
   getBeadRpc,
   initBeadsRpc,
   listBeadsRpc,
+  MIN_BD_VERSION,
   updateBeadRpc,
   type BeadDependency,
   type BeadIssue,
+  type BeadsFeedMode,
+  type BeadsTransport,
   type BeadStatus,
+  type ListBeadsResult,
 } from "../shared/beads";
 import {
   FONT_SIZE,
@@ -446,34 +451,55 @@ function BeadDetailPanel({
     [types, issue.issueType],
   );
 
-  // Resolves the reverse dependency direction ("required by"), which list/update/create
-  // never return — only `bd show --include-dependents` does. Cheap, so fetched per expand
-  // rather than for every row in the table.
+  // Everything this panel shows is already in the cached row — text, and both link directions
+  // (the server reverse-indexes the edges). The fetch is a fallback for a bead we only know from
+  // a journal record that carried no description, so normally it never runs.
   const detailQuery = useQuery({
     queryKey: ["bead-detail", projectId, issue.id],
     queryFn: () => getBeadCall({ projectId, id: issue.id }),
+    enabled: issue.description === null,
   });
-  const dependencies = detailQuery.data?.issue?.dependencies ?? issue.dependencies;
-  const dependents = detailQuery.data?.issue?.dependents ?? [];
+  const fetchedIssue = detailQuery.data?.issue ?? null;
+  const dependencies = issue.dependencies.length > 0 ? issue.dependencies : fetchedIssue?.dependencies ?? [];
+  const dependents = issue.dependents.length > 0 ? issue.dependents : fetchedIssue?.dependents ?? [];
 
+  // Seed the editor once the text arrives, unless the user is already typing into it.
+  const fetchedDescription = fetchedIssue?.description ?? null;
+  useEffect(() => {
+    if (fetchedDescription === null || isEditingDescription || editDescription !== "") return;
+    setEditDescription(fetchedDescription);
+  }, [fetchedDescription, isEditingDescription, editDescription]);
+
+  const baseDescription = issue.description ?? fetchedDescription ?? "";
   const isDirty =
     editTitle !== issue.title ||
-    editDescription !== (issue.description ?? "") ||
+    editDescription !== baseDescription ||
     editStatus !== issue.status ||
     editPriority !== issue.priority ||
     editType !== issue.issueType;
 
   const updateMutation = useMutation({
     mutationFn: async () => {
-      const patch: { title?: string; description?: string; priority?: number; status?: string; issueType?: string } = {};
+      const patch: {
+        title?: string;
+        description?: string;
+        priority?: number;
+        status?: string;
+        issueType?: string;
+      } = {};
       if (editTitle !== issue.title) patch.title = editTitle;
-      if (editDescription !== (issue.description ?? "")) patch.description = editDescription;
+      if (editDescription !== baseDescription) patch.description = editDescription;
       if (editStatus !== issue.status) patch.status = editStatus;
       if (editPriority !== issue.priority) patch.priority = editPriority;
       if (editType !== issue.issueType) patch.issueType = editType;
-      return updateBeadCall({ projectId, id: issue.id, ...patch });
+      return updateBeadCall({ projectId, id: issue.id, ...patch, ifStatus: issue.status });
     },
     onSuccess: (result) => {
+      if (result.conflict) {
+        toast.error(result.error ?? "That bead changed while you were editing it.");
+        onIssueUpdated(issue); // reloads the list; the edits stay in the form
+        return;
+      }
       if (result.error || !result.issue) {
         toast.error(result.error ?? "Failed to update bead");
         return;
@@ -880,6 +906,94 @@ function SkeletonTable({ styles, theme }: { styles: PanelStyles; theme: PluginTh
   );
 }
 
+interface FeedStatusProps {
+  mode: BeadsFeedMode;
+  transport: BeadsTransport;
+  supportsEvents: boolean;
+  journalEnabled: boolean;
+  bdVersion: string | null;
+  enabling: boolean;
+  styles: PanelStyles;
+  theme: PluginTheme;
+  onEnable: () => void;
+}
+
+/** Footer badge for where the list comes from. When bd can follow the journal but the workspace
+ * hasn't opted in, the badge is the opt-in. */
+function FeedStatus({
+  mode,
+  transport,
+  supportsEvents,
+  journalEnabled,
+  bdVersion,
+  enabling,
+  styles,
+  theme,
+  onEnable,
+}: FeedStatusProps) {
+  if (mode === "live") {
+    const served = transport === "http";
+    return (
+      <View
+        style={styles.feedStatus}
+        {...hoverTitle(
+          served
+            ? "Following `bd serve`'s event stream — no `bd` process per call"
+            : "Following `bd events tail` — no polling",
+        )}
+      >
+        <Icon name="Circle" size={8} color={theme.colors.statusSuccess} />
+        <Text style={styles.footerCount}>{served ? "Live · served" : "Live"}</Text>
+      </View>
+    );
+  }
+
+  if (!supportsEvents) {
+    return (
+      <Text
+        style={styles.footerCount}
+        {...hoverTitle(`Live updates need bd ${MIN_BD_VERSION} or newer`)}
+      >
+        Polling every 5s{bdVersion ? ` · bd ${bdVersion}` : ""}
+      </Text>
+    );
+  }
+
+  if (!journalEnabled) {
+    return (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Enable live updates"
+        onPress={onEnable}
+        disabled={enabling}
+        {...hoverTitle("Runs `bd config set events-journal true` — every bd command in this checkout is journaled from then on")}
+      >
+        <Text style={enabling ? [styles.linkAction, styles.buttonDisabled] : styles.linkAction}>
+          {enabling ? "Enabling live updates..." : "Enable live updates"}
+        </Text>
+      </Pressable>
+    );
+  }
+
+  return <Text style={styles.footerCount}>Polling every 5s</Text>;
+}
+
+/** True when two snapshots differ only in their issue list — i.e. an `unchanged` response
+ * whose feed state also matches, so the previous object can be handed back as-is. */
+function isSameFeedState(previous: ListBeadsResult, next: ListBeadsResult): boolean {
+  return (
+    previous.revision === next.revision &&
+    previous.available === next.available &&
+    previous.error === next.error &&
+    previous.mode === next.mode &&
+    previous.transport === next.transport &&
+    previous.transportError === next.transportError &&
+    previous.supportsEvents === next.supportsEvents &&
+    previous.journalEnabled === next.journalEnabled &&
+    previous.bdVersion === next.bdVersion
+  );
+}
+
 export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: PluginWorkspacePanelProps) {
   const paseo = usePaseo();
   const workspaceInfo = useWorkspace(workspaceId, (workspace) => ({
@@ -892,17 +1006,63 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
   const listBeads = useRpc(listBeadsRpc);
   const initBeadsCall = useRpc(initBeadsRpc);
   const beadsMetaCall = useRpc(beadsMetaRpc);
+  const enableEventsCall = useRpc(enableBeadEventsRpc);
   const toast = useToast();
   const styles = useMemo(() => buildStyles(theme, layout.compact), [theme, layout.compact]);
 
+  // Last snapshot we were handed, so a poll can say "still on revision N" and be answered
+  // with `unchanged` instead of the whole list. Revisions are per project root, so a project
+  // switch drops the cursor rather than carrying it across.
+  const snapshotRef = useRef<{ projectId: string; result: ListBeadsResult } | null>(null);
+
   const beadsQuery = useQuery({
     queryKey: ["beads-list", projectId],
-    queryFn: () => listBeads({ projectId: projectId ?? "" }),
+    queryFn: async () => {
+      const id = projectId ?? "";
+      const cached = snapshotRef.current?.projectId === id ? snapshotRef.current.result : null;
+      const result = await listBeads({ projectId: id, sinceRevision: cached?.revision });
+      // An `unchanged` response carries no issues: keep the list we already hold, and keep the
+      // whole object identical when nothing else moved either, so nothing re-renders.
+      const next =
+        result.unchanged && cached
+          ? isSameFeedState(cached, result)
+            ? cached
+            : { ...result, issues: cached.issues }
+          : result;
+      snapshotRef.current = { projectId: id, result: next };
+      return next;
+    },
     enabled: Boolean(projectId),
-    refetchInterval: 5_000,
+    // Live mode answers from a cache the journal keeps in step — no `bd` process per read —
+    // so it can afford a tighter interval than the `bd list` fallback.
+    refetchInterval: (query) => (query.state.data?.mode === "live" ? 2_000 : 5_000),
     refetchOnWindowFocus: true,
   });
   const refetchBeads = beadsQuery.refetch;
+
+  const feedMode = beadsQuery.data?.mode ?? "poll";
+  const transport = beadsQuery.data?.transport ?? "cli";
+  const supportsEvents = beadsQuery.data?.supportsEvents ?? false;
+  const journalEnabled = beadsQuery.data?.journalEnabled ?? false;
+  const bdVersion = beadsQuery.data?.bdVersion ?? null;
+  const transportError = beadsQuery.data?.transportError ?? null;
+
+  const enableEventsMutation = useMutation({
+    mutationFn: () => enableEventsCall({ projectId: projectId ?? "" }),
+    onSuccess: (result) => {
+      if (!result.ok) {
+        toast.error(result.error ?? "Failed to enable the bd events journal");
+        return;
+      }
+      toast.show("Live updates on", { variant: "success" });
+      snapshotRef.current = null;
+      void refetchBeads();
+    },
+    onError: (error: unknown) => {
+      toast.error(error instanceof Error ? error.message : "Failed to enable the bd events journal");
+    },
+  });
+  const handleEnableEvents = useCallback(() => enableEventsMutation.mutate(), [enableEventsMutation]);
 
   // Type/status vocabularies rarely change — fetch once per mount, no polling.
   const metaQuery = useQuery({
@@ -1046,6 +1206,8 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
 
   const available = Boolean(beadsQuery.data?.available);
   const showStaleErrorBanner = beadsQuery.isError && allIssues.length > 0;
+  const showVersionBanner = available && beadsQuery.data !== undefined && !supportsEvents;
+  const notice = transportError ?? null;
 
   let content: ReactNode;
   if (!projectId) {
@@ -1149,6 +1311,19 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
           <Text style={styles.errorBannerText}>Couldn't refresh beads. Showing the last known list.</Text>
         </View>
       ) : null}
+      {notice ? (
+        <View style={styles.noticeBanner}>
+          <Text style={styles.noticeBannerText}>{notice}</Text>
+        </View>
+      ) : null}
+      {showVersionBanner ? (
+        <View style={styles.noticeBanner}>
+          <Text style={styles.noticeBannerText}>
+            This plugin targets bd {MIN_BD_VERSION} or newer{bdVersion ? ` — found ${bdVersion}` : ""}. It works
+            without it, but the list falls back to polling instead of following the events journal.
+          </Text>
+        </View>
+      ) : null}
       {available ? (
         <View style={{ gap: SPACE[2] }}>
           <View style={styles.toolbar}>
@@ -1205,12 +1380,27 @@ export function BeadsWorkspacePanel({ theme, layout, workspaceId, navigation }: 
         />
       ) : null}
       {content}
-      {available && allIssues.length > 0 ? (
-        <Text style={styles.footerCount}>
-          {matchCount === allIssues.length
-            ? pluralize(allIssues.length, "issue")
-            : `${matchCount} of ${allIssues.length} issues`}
-        </Text>
+      {available ? (
+        <View style={styles.footerRow}>
+          {allIssues.length > 0 ? (
+            <Text style={styles.footerCount}>
+              {matchCount === allIssues.length
+                ? pluralize(allIssues.length, "issue")
+                : `${matchCount} of ${allIssues.length} issues`}
+            </Text>
+          ) : null}
+          <FeedStatus
+            mode={feedMode}
+            transport={transport}
+            supportsEvents={supportsEvents}
+            journalEnabled={journalEnabled}
+            bdVersion={bdVersion}
+            enabling={enableEventsMutation.isPending}
+            styles={styles}
+            theme={theme}
+            onEnable={handleEnableEvents}
+          />
+        </View>
       ) : null}
     </ScrollView>
   );

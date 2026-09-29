@@ -32,10 +32,15 @@ It's a thin UI over the real CLI, not a reimplementation: every action shells ou
   (`bd init --non-interactive` in the project root).
 - On an open, unblocked bead, **Create workspace** spins up a worktree and links it back to
   the bead (`external-ref`), so the panel remembers which workspace picked it up.
+- **Live updates** follow bd's [events journal](https://beads.gascity.com/reference/events-journal)
+  (bd ≥ 1.3.0) rather than polling. It's opt-in per workspace, so the footer either says **Live**
+  or is the button that turns it on. Older `bd` polls as before.
+- Edits are guarded: saving over a bead someone else moved is refused and reloaded, not
+  overwritten.
 
 ## Setup
 
-Install `bd`: https://github.com/gastownhall/beads#-quick-start
+Install `bd` (≥ 1.3.0 for live updates): https://github.com/gastownhall/beads#-quick-start
 
 Initialize it in your project's root checkout (not a worktree):
 
@@ -52,9 +57,11 @@ paseo plugin add pasteley/paseo-beads
 
 ## Known problems/limitations
 
-- **Slow.** Every action shells out to a fresh `bd` process, roughly 300ms per click, since
-  `bd init` defaults to an embedded engine rather than the sql-server mode.
-- **No live updates.** List and detail poll every 5s, no push/watch.
+- **Slow writes.** Every action shells out to a fresh `bd` process, roughly 300ms per click,
+  since `bd init` defaults to an embedded engine. Pointing `BD_SERVE_URL` at a running `bd serve`
+  avoids that, but serve needs a Dolt server-mode workspace, so not on a default `bd init`.
+- **No push to the panel.** The Paseo plugin runtime is request/response only, so the panel still
+  polls its own server — but that read is a memory lookup, not a `bd` call.
 - **No "open workspace" link** on any released Paseo build yet, so no navigation API availible.
 - **No reverse link.** A bead knows its workspace, but a workspace doesn't show its bead.
 - **Hand-rolled markdown**, not Paseo's real renderer. A small subset of CommonMark.
@@ -64,5 +71,7 @@ paseo plugin add pasteley/paseo-beads
 ## Requirements
 
 - Paseo ≥ 0.8.0
+- `bd` ≥ 1.3.0 (targeted, for `bd events`; earlier works minus live updates)
 - Node ≥ 22 (for `Promise.withResolvers`)
 - `bd` on `PATH` (or set `BD_BINARY` to an absolute path)
+- Optional: `BD_SERVE_URL` (and `BD_SERVE_TOKEN`) to talk to a running `bd serve`

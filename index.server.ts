@@ -1,9 +1,20 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { beadsMeta, createBead, deleteBead, getBead, initBead, listBeads, updateBead } from "./server/beads";
+import {
+  beadsMeta,
+  createBead,
+  deleteBead,
+  enableBeadEvents,
+  getBead,
+  initBead,
+  listBeads,
+  updateBead,
+} from "./server/beads";
+import { stopAllBeadsFeeds } from "./server/feed";
 import {
   beadsMetaRpc,
   createBeadRpc,
   deleteBeadRpc,
+  enableBeadEventsRpc,
   getBeadRpc,
   initBeadsRpc,
   listBeadsRpc,
@@ -18,5 +29,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(deleteBeadRpc, deleteBead);
   server.handle(initBeadsRpc, initBead);
   server.handle(beadsMetaRpc, beadsMeta);
-  return () => {};
+  server.handle(enableBeadEventsRpc, enableBeadEvents);
+  return () => {
+    stopAllBeadsFeeds();
+  };
 }
